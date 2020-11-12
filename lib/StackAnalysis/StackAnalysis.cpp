@@ -12,9 +12,30 @@
 #include <sstream>
 #include <vector>
 
+#include "llvm/Analysis/ScopedNoAliasAA.h"
+#include "llvm/CodeGen/UnreachableBlockElim.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/JumpThreading.h"
+#include "llvm/Transforms/Scalar/MergedLoadStoreMotion.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 
+#include "revng/ADT/Queue.h"
+#include "revng/BasicAnalyses/CSVAliasAnalysis.h"
+#include "revng/BasicAnalyses/GeneratedCodeBasicInfo.h"
+#include "revng/BasicAnalyses/RemoveHelperCalls.h"
+#include "revng/BasicAnalyses/RemoveNewPCCalls.h"
 #include "revng/StackAnalysis/StackAnalysis.h"
 #include "revng/Support/CommandLine.h"
 #include "revng/Support/IRHelpers.h"
@@ -33,6 +54,7 @@ static Logger<> StackAnalysisLog("stackanalysis");
 static Logger<> CFEPLog("cfep");
 
 using namespace llvm::cl;
+using GCBI = GeneratedCodeBasicInfo;
 
 namespace StackAnalysis {
 
@@ -64,6 +86,294 @@ static opt<std::string> ABIAnalysisOutputPath("abi-analysis-output",
                                                    "ABI Analysis Pass"),
                                               value_desc("path"),
                                               cat(MainCategory));
+
+template<class FunctionOracle>
+Func CFEPAnalyzer<FunctionOracle>::analyze(llvm::BasicBlock *Entry) {
+  llvm::Function *OutFunc = createDisposableFunction(Entry);
+
+  llvm::SmallVector<llvm::GlobalVariable *, 8> ABIRegisters;
+  for (auto *CSV : GCBI.abiRegisters())
+    if (CSV && !(GCBI.isSPReg(CSV)))
+      ABIRegisters.emplace_back(CSV);
+
+  // Identify the callee-saved registers and tell if a function is regular.
+  // To achieve this, we craft the IR by loading SP at function entry and end.
+  llvm::IRBuilder<> Builder(&OutFunc->getEntryBlock().front());
+  auto *IntPtrTy = GCBI.spReg()->getType();
+  auto *IntTy = GCBI.spReg()->getType()->getElementType();
+
+  auto *SP = Builder.CreateLoad(
+    M.getGlobalVariable(GCBI.spReg()->getName(), true));
+  auto *SPPtr = Builder.CreateIntToPtr(SP, IntPtrTy);
+  auto *GEPI = Builder.CreateGEP(IntTy,
+                                 SPPtr,
+                                 llvm::ConstantInt::get(IntTy, 0));
+  auto *RA = Builder.CreateLoad(SPPtr);
+
+  llvm::SmallVector<llvm::Value *, 8> CSVI;
+  for (auto *CSR : ABIRegisters) {
+    auto *V = Builder.CreateLoad(M.getGlobalVariable(CSR->getName(), true));
+    CSVI.emplace_back(V);
+  }
+
+  llvm::Instruction *Last = nullptr;
+  for (auto &BB : *OutFunc)
+    if (auto *Ret = dyn_cast<llvm::ReturnInst>(&BB.back()))
+      Last = Ret;
+
+  if (Last) {
+    Builder.SetInsertPoint(Last);
+
+    auto *PC = Builder.CreateLoad(
+      M.getGlobalVariable(GCBI.pcReg()->getName(), true));
+
+    llvm::SmallVector<llvm::Value *, 8> CSVE;
+    for (auto *CSR : ABIRegisters) {
+      auto *V = Builder.CreateLoad(M.getGlobalVariable(CSR->getName(), true));
+      CSVE.emplace_back(V);
+    }
+
+    SP = Builder.CreateLoad(M.getGlobalVariable(GCBI.spReg()->getName(), true));
+    SPPtr = Builder.CreateIntToPtr(SP, IntPtrTy);
+    auto *GEPE = Builder.CreateGEP(IntTy,
+                                   SPPtr,
+                                   llvm::ConstantInt::get(IntTy, 0));
+
+    auto *SPI = Builder.CreatePtrToInt(GEPI, IntTy);
+    auto *SPE = Builder.CreatePtrToInt(GEPE, IntTy);
+
+    // Difference between the return address and the program counter.
+    // Recall that functions leaving the stack pointer higher than
+    // it was at function entry (i.e., in an irregular state) are
+    // marked as fake functions.
+    auto *IsRet = Builder.CreateSub(PC, RA);
+
+    // Compute the difference between the stack pointer values to
+    // evaluate the stack height and between the CSR values as well.
+    auto *SPDiff = Builder.CreateSub(SPE, SPI);
+
+    llvm::SmallVector<llvm::Type *, 8> ArgTypes = { IntTy, IntTy };
+    llvm::SmallVector<llvm::Value *, 8> ArgValues = { IsRet, SPDiff };
+    for (unsigned I = 0; I < CSVI.size(); ++I) {
+      auto *V = Builder.CreateSub(CSVE[I], CSVI[I]);
+      ArgTypes.emplace_back(IntTy);
+      ArgValues.emplace_back(V);
+    }
+
+    OFPIndirectBranchInfo.addFnAttribute(llvm::Attribute::NoUnwind);
+    auto *OpqFunc = OFPIndirectBranchInfo
+                      .get(Last->getParent()->getParent()->getName(),
+                           IntTy,
+                           ArgTypes,
+                           "indirect_branch_info");
+
+    // Is jumping to the return address? What is the stack height?
+    // What are the callee-saved registers? Where do we come from?
+    Builder.CreateCall(OpqFunc, ArgValues);
+  }
+
+  // Run optimization passes over the disposable function
+  {
+    llvm::FunctionPassManager FPM;
+
+    // First stage: simplify the IR and compute redundant
+    // expressions in order to find out the stack height.
+    FPM.addPass(RemoveNewPCCallsPass());
+    FPM.addPass(RemoveHelperCallsPass());
+    FPM.addPass(llvm::PromotePass());
+    FPM.addPass(llvm::JumpThreadingPass());
+    FPM.addPass(llvm::UnreachableBlockElimPass());
+    FPM.addPass(llvm::InstCombinePass(false));
+    FPM.addPass(llvm::EarlyCSEPass(true));
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::MergedLoadStoreMotionPass());
+    FPM.addPass(llvm::GVN());
+
+    // Second stage: add CSVAA and perform GEP transformation.
+    // Since the IR may change remarkably, another round of
+    // GVN is necessary to take more optimization opportunities.
+    FPM.addPass(llvm::InstCombinePass(false));
+    FPM.addPass(CSVAliasAnalysisPass<true>());
+    FPM.addPass(llvm::InstCombinePass(false));
+    FPM.addPass(llvm::GVN());
+
+    llvm::FunctionAnalysisManager FAM;
+    FAM.registerPass([] {
+      llvm::AAManager AA;
+      AA.registerFunctionAnalysis<llvm::BasicAA>();
+      AA.registerFunctionAnalysis<llvm::ScopedNoAliasAA>();
+
+      return AA;
+    });
+
+    llvm::ModuleAnalysisManager MAM;
+    MAM.registerPass([&] { return GeneratedCodeBasicInfoAnalysis(); });
+    FAM.registerPass([&] { return GeneratedCodeBasicInfoAnalysis(); });
+    FAM.registerPass(
+      [&] { return llvm::ModuleAnalysisManagerFunctionProxy(MAM); });
+
+    llvm::PassBuilder PB;
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerModuleAnalyses(MAM);
+
+    FPM.run(*OutFunc, FAM);
+  }
+
+  // Is the disposable function a FakeFunction?
+  bool IsFake = Oracle.isFakeFunction(OutFunc);
+
+  // Do not throw it if it's a FakeFunction
+  if (!IsFake) {
+    throwDisposableFunction(OutFunc);
+    OutFunc = nullptr;
+  }
+
+  return Func(IsFake ? FunctionKind::Fake : FunctionKind::Regular, OutFunc);
+}
+
+template<class FunctionOracle>
+void CFEPAnalyzer<FunctionOracle>::integrateFunctionCallee(
+  llvm::BasicBlock *BB) {
+  using namespace llvm;
+
+  auto *Term = BB->getTerminator();
+  auto *Call = getFunctionCall(Term);
+
+  // If the successor is null, we are dealing with an indirect call.
+  auto *Next = getFunctionCallCallee(Term);
+
+  // What are the registers clobbered by the callee?
+  const auto &ClobberedRegs = Oracle.getRegistersClobbered(Next);
+
+  // What is the function type of the callee?
+  FunctionKind Ty = Oracle.getFunctionType(Next);
+
+  switch (Ty) {
+  case FunctionKind::Regular: {
+    BranchInst *Br = BranchInst::Create(getFallthrough(Term));
+    ReplaceInstWithInst(Term, Br);
+
+    auto *FTy = llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+    auto *PreHookOpqF = OFPHooksFunctionCall.get("__precall_pure_function",
+                                                 FTy,
+                                                 "precall_hook");
+    CallInst::Create(PreHookOpqF, "", Br);
+
+    // Prevent the store instructions from being optimized out by storing
+    // the rval of a call to an opaque function into the clobbered registers.
+    OFPRegistersClobbered.addFnAttribute(Attribute::ReadOnly);
+    OFPRegistersClobbered.addFnAttribute(Attribute::NoUnwind);
+
+    auto *RegsClobbOpqF = OFPRegistersClobbered.get(BB->getParent()->getName(),
+                                                    Type::getInt64Ty(Context),
+                                                    {},
+                                                    "registers_clobbered");
+    for (GlobalVariable *Reg : ClobberedRegs)
+      new StoreInst(CallInst::Create(RegsClobbOpqF, "", Br), Reg, Br);
+
+    auto *PostHookOpqF = OFPHooksFunctionCall.get("__postcall_pure_function",
+                                                  FTy,
+                                                  "postcall_hook");
+    CallInst::Create(PostHookOpqF, "", Br);
+    break;
+  }
+
+  case FunctionKind::NoReturn: {
+    ReturnInst *Ret = ReturnInst::Create(Context);
+    ReplaceInstWithInst(Term, Ret);
+    break;
+  }
+
+  case FunctionKind::Fake: {
+    BranchInst *Br = BranchInst::Create(getFallthrough(Term));
+
+    // Get the fake function by its entry basic block.
+    Function *FakeFunction = Oracle.getFakeFunction(Next);
+
+    // Must have already been analyzed.
+    revng_assert(FakeFunction != nullptr);
+
+    // If possible, inline the fake function.
+    auto *CI = CallInst::Create(FakeFunction, "", Term);
+    InlineFunctionInfo IFI;
+    bool Status = InlineFunction(llvm::CallSite(CI), IFI, nullptr, true);
+
+    // Still need to replace the successor with the fall-through.
+    ReplaceInstWithInst(Term, Br);
+    break;
+  }
+
+  default:
+    revng_abort();
+  }
+
+  Call->eraseFromParent();
+}
+
+template<class FunctionOracle>
+llvm::Function *CFEPAnalyzer<FunctionOracle>::createDisposableFunction(
+  llvm::BasicBlock *Entry) {
+  using namespace llvm;
+  Function *Root = Entry->getParent();
+
+  OnceQueue<BasicBlock *> Queue;
+  std::vector<BasicBlock *> BlocksToClone;
+  Queue.insert(Entry);
+
+  while (!Queue.empty()) {
+    BasicBlock *Current = Queue.pop();
+
+    BlocksToClone.emplace_back(Current);
+
+    if (isFunctionCall(Current)) {
+      auto *Succ = getFallthrough(Current);
+      revng_assert(Succ != nullptr);
+      Queue.insert(Succ);
+      continue;
+    }
+
+    for (auto *Succ : successors(Current)) {
+      if (!GCBI::isPartOfRootDispatcher(Succ))
+        Queue.insert(Succ);
+    }
+  }
+
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 8> BlocksToExtract;
+
+  for (const auto &BB : BlocksToClone) {
+    auto *Cloned = CloneBasicBlock(BB, VMap, Twine("__cloned"), Root);
+
+    if (isFunctionCall(Cloned))
+      integrateFunctionCallee(Cloned);
+
+    VMap[BB] = Cloned;
+    BlocksToExtract.emplace_back(Cloned);
+  }
+
+  remapInstructionsInBlocks(BlocksToExtract, VMap);
+
+  CodeExtractorAnalysisCache CEAC(*Root);
+  Function *OutlinedFunction = CodeExtractor(BlocksToExtract)
+                                 .extractCodeRegion(CEAC);
+
+  revng_assert(OutlinedFunction != nullptr);
+  revng_assert(OutlinedFunction->arg_size() == 0);
+  revng_assert(OutlinedFunction->getReturnType()->isVoidTy());
+
+  cast<Instruction>(*OutlinedFunction->user_begin())
+    ->getParent()
+    ->eraseFromParent();
+
+  return OutlinedFunction;
+}
+
+template<class FunctionOracle>
+void CFEPAnalyzer<FunctionOracle>::throwDisposableFunction(llvm::Function *F) {
+  revng_assert(F->use_empty()
+               && "Failed to remove all users of the outlined function.");
+  F->eraseFromParent();
+}
 
 template<bool AnalyzeABI>
 bool StackAnalysis<AnalyzeABI>::runOnModule(Module &M) {
@@ -121,6 +431,20 @@ bool StackAnalysis<AnalyzeABI>::runOnModule(Module &M) {
     revng_log(CFEPLog,
               getName(Function.Entry) << (Function.Force ? " (forced)" : ""));
   }
+
+  // Isolate function starting from the collected entrypoints
+  // and analyze them.
+  using CFEPA = CFEPAnalyzer<FunctionProperties>;
+  FunctionProperties Properties;
+
+  for (CFEP &Function :
+       llvm::make_range(Functions.rbegin(), Functions.rend())) {
+    CFEPA Analyzer(M, GCBI, Properties);
+    Properties.registerFunc(Function.Entry, Analyzer.analyze(Function.Entry));
+  }
+
+  // Still OK?
+  revng_assert(llvm::verifyModule(M, &llvm::dbgs()) == false);
 
   // Initialize the cache where all the results will be accumulated
   Cache TheCache(&F, &GCBI);
